@@ -1,0 +1,504 @@
+---
+title: "Sentiment Analysis on Trump's Tweets"
+author: "Rose Cheng"
+date: "2026-03-08"
+output: pdf_document
+---
+
+```{r}
+# Load required libraries
+library(dplyr)
+library(stringr)
+library(tidyr)
+library(tidytext)
+library(lubridate)
+library(ggplot2)
+library(broom)
+# Import datasets
+pre <- read.csv("/Users/rose/Desktop/Trump Tweets 2009-2024-selected/tweets_01-08-2021.csv", stringsAsFactors = FALSE)
+post <- read.csv("/Users/rose/Desktop/Trump Tweets 2009-2024-selected/trump_post_2021.csv", stringsAsFactors = FALSE)
+```
+
+```{r}
+library(textdata)
+#define the periods (post and pre) & fix date times in post
+pre2 <- pre %>%
+  transmute(
+  id = as.character(id),
+  text = as.character(text),
+  favorites = as.numeric(favorites),
+  retweets = as.numeric(retweets),
+  isRetweet = as.character(isRetweet),
+  datetime = suppressWarnings(ymd_hms(date, tz = "UTC")),
+  period = "Before 2021"
+)
+post2 <- post %>%
+  transmute(
+  id = as.character(id),
+  text = as.character(text),
+  favorites = as.numeric(favorites),
+  retweets = as.numeric(retweets),
+  isRetweet = as.character(isRetweet),
+  datetime = suppressWarnings(ymd_hms(posix_date, tz = "UTC")),
+  period = "After 2021"
+)
+#combine both datasets
+df <- bind_rows(pre2, post2) %>%
+  mutate(
+  period = factor(period, levels = c("Before 2021", "After 2021")),
+  isRetweet = case_when(
+  isRetweet %in% c("t", "TRUE", "True", "1")~ TRUE,
+  isRetweet %in% c("f", "FALSE", "False", "0")~ FALSE,
+  TRUE~ NA
+)
+)
+# Feature engineering (remove NA's, outliers, & get lengths)
+df_feat <- df %>%
+  mutate(
+  char_count = str_length(text),
+  caps_count = str_count(text, "\\b[A-Z]{2,}\\b"),
+  exclaim_count = str_count(text, fixed("!")),
+  emphasis = (caps_count > 0 & exclaim_count > 0)
+) %>%
+#filter outliers
+  filter(char_count < 1200) %>%
+  filter(!is.na(favorites), !is.na(retweets), !is.na(text)) %>%
+  filter(!is.na(isRetweet)) #remove NAs
+#load sentiment lexicons - bing & afinn
+  bing <- get_sentiments("bing")
+  bing <- bing %>%
+  filter(!word %in% c("trump", "donald", "maga"))
+  afinn <- get_sentiments("afinn")
+  afinn <- afinn %>%
+  filter(!word %in% c("trump", "donald", "maga"))
+#clean and tokenize (bing) text
+df_bing <- df_feat %>%
+  mutate(text_clean = str_remove_all(text, "https?://\\S+")) %>%
+  unnest_tokens(word, text_clean) %>%
+  inner_join(bing, by = "word") %>%
+  count(id, period, sentiment, name = "n") %>%
+  mutate(score = if_else(sentiment== "positive", n,-n)) %>%
+  summarise(sentiment_bing = sum(score), .by = c(id, period))
+#clean and tokenize (afinn) text
+df_afinn <- df_feat %>%
+  mutate(text_clean = str_remove_all(text, "https?://\\S+")) %>%
+  unnest_tokens(word, text_clean) %>%
+  inner_join(afinn, by = "word") %>%
+  summarise(sentiment_afinn = sum(value), .by = c(id, period))
+#merge sentiments back into original data
+df_model <- df_feat %>%
+  left_join(df_bing, by = c("id", "period")) %>%
+  left_join(df_afinn, by = c("id", "period")) %>%
+  mutate(
+  sentiment_bing = replace_na(sentiment_bing, 0),
+  sentiment_afinn = replace_na(sentiment_afinn, 0),
+  log_fav = log1p(favorites),
+  log_rt = log1p(retweets)
+)
+#fix isRetweet error
+df_model <- df_model %>%
+  mutate(
+  isRetweet = factor(isRetweet, levels = c(FALSE, TRUE)),
+  emphasis = factor(emphasis, levels = c(FALSE, TRUE))
+)
+```
+
+## Testing lexicon accuracy using a testing sample of 100 tweets:
+```{r}
+set.seed(100)
+#draw samples from both datasets to evaluate baseline afinn lexicon accuracy:
+sample_twitter <- df_model %>%
+  filter(period == "Before 2021") %>%
+  sample_n(100)
+
+sample_truth_social <- df_model %>%
+  filter(period == "After 2021") %>%
+  sample_n(100)
+
+#combine them:
+sample_posts <- bind_rows(sample_twitter, sample_truth_social)
+sample_posts <- sample_posts %>%
+  mutate(human_sentiment = NA)
+
+#export for human validation:
+#write.csv(sample_posts, "sentiment_validation_sample.csv", row.names = FALSE)
+
+sample_posts_evaluated <- read.csv("/Users/rose/Desktop/STATS 140XP Final project/code/sentiment_validation_sample.csv")
+sample_posts_evaluated <- sample_posts_evaluated %>%
+  mutate(
+    afinn_label = case_when(
+      sentiment_afinn > 0 ~ "positive",
+      sentiment_afinn < 0 ~ "negative",
+      TRUE ~ "neutral"
+    )
+  )
+accuracy <- mean(sample_posts_evaluated$human_sentiment == sample_posts_evaluated$afinn_label)
+accuracy
+
+#accuracy by sentiment:
+sample_posts_evaluated %>%
+  mutate(correct = human_sentiment == afinn_label) %>%
+  group_by(human_sentiment) %>%
+  summarise(accuracy = mean(correct))
+```
+
+## Testing lexicon accuracy using the same testing sample with extended AFINN:
+```{r}
+##create custom dictionary:
+custom_words <- tibble(
+  word = c(
+    "crooked","rigged","hoax","witch","radical","corrupt",
+    "tremendous","incredible","fantastic","beautiful","greatest","successful"
+  ),
+  value = c(
+    -3,-3,-3,-2,-2,-3,   # negative scores
+    3,3,3,2,3,2          # positive scores
+  )
+)
+
+## check which words are missing from AFINN:
+missing_words <- setdiff(custom_words$word, afinn$word)
+custom_words_filtered <- custom_words %>%
+  filter(word %in% missing_words)
+
+## extend AFINN:
+afinn_extended <- bind_rows(afinn, custom_words_filtered)
+
+## evaluate accuracy using extended AFINN:
+validation_afinn_ext <- sample_posts_evaluated %>%
+  mutate(text_clean = str_remove_all(text, "https?://\\S+")) %>%
+  unnest_tokens(word, text_clean) %>%
+  inner_join(afinn_extended, by = "word") %>%
+  group_by(id) %>%
+  summarise(score_ext = sum(value), .groups = "drop")
+
+## merge scores back:
+validation_compare <- sample_posts_evaluated %>%
+  left_join(validation_afinn_ext, by = "id")
+
+## fix missing scores and create labels:
+sample_post_ext <- validation_compare %>%
+  mutate(
+    score_ext = replace_na(score_ext, 0),
+    afinn_ext_label = case_when(
+      score_ext > 0 ~ "positive",
+      score_ext < 0 ~ "negative",
+      TRUE ~ "neutral"
+    )
+  )
+
+## compute accuracy for extended AFINN:
+accuracy_ext <- mean(sample_post_ext$human_sentiment == sample_post_ext$afinn_ext_label)
+accuracy_ext
+
+#accuracy by sentiment:
+sample_post_ext %>%
+  mutate(correct = human_sentiment == afinn_ext_label) %>%
+  group_by(human_sentiment) %>%
+  summarise(accuracy = mean(correct))
+
+table(sample_post_ext$human_sentiment,
+      sample_post_ext$afinn_ext_label)
+```
+
+
+## Data cleaning: Compute sentiment scores using extended AFINN, removing retweets(fav = 0), and compute z-scores per platform
+```{r}
+## Compute sentiment scores for the entire dataset using the extended AFINN:
+afinn_scores <- df_model %>%
+  mutate(text_clean = str_remove_all(text, "https?://\\S+")) %>%
+  unnest_tokens(word, text_clean) %>%
+  inner_join(afinn_extended, by = "word") %>%
+  group_by(id) %>%
+  summarise(sentiment_afinn_ext = sum(value), .groups = "drop")
+
+## Merge scores back to the full dataset
+df_model_ext <- df_model %>%
+  left_join(afinn_scores, by = "id")
+
+## Replace missing scores:
+df_model_ext <- df_model_ext %>%
+  mutate(sentiment_afinn_ext = replace_na(sentiment_afinn_ext, 0))
+
+## Convert score to sentiment label
+df_model_ext <- df_model_ext %>%
+  mutate(
+    sentiment_label_ext = case_when(
+      sentiment_afinn_ext > 0 ~ "positive",
+      sentiment_afinn_ext < 0 ~ "negative",
+      TRUE ~ "neutral"
+    ) 
+  ) %>%
+  select(-c(sentiment_bing, sentiment_afinn))
+
+## removing retweets (favorites = 0):
+df_model_ext <- df_model_ext %>%
+  filter(favorites != 0) 
+
+## Compute z-scores per platform:
+df_model_ext <- df_model_ext %>%
+  group_by(period) %>%
+  mutate(
+    rel_fav = (favorites - mean(favorites, na.rm = TRUE)) / sd(favorites, na.rm = TRUE),
+    rel_rt  = (retweets - mean(retweets, na.rm = TRUE)) / sd(retweets, na.rm = TRUE)
+  ) %>%
+  ungroup()
+```
+
+## EDA with the cleaned dataset:
+```{r}
+# distribution of sentiment_afinn_ext:
+ggplot(df_model_ext, aes(x = sentiment_afinn_ext, fill = sentiment_label_ext)) +
+  geom_histogram(binwidth = 1) +
+  labs(
+    title = "Distribution of Sentiment Scores",
+    x = "Sentiment Score",
+    y = "Number of Posts",
+    fill = "Sentiment"
+  ) +
+  theme_minimal()
+
+# distribution of sentiment categories:
+ggplot(df_model_ext, aes(x = sentiment_label_ext, fill = sentiment_label_ext)) +
+  geom_bar() +
+  labs(
+    title = "Distribution of Sentiment Categories",
+    x = "Sentiment",
+    y = "Number of Posts"
+  ) +
+  theme_minimal()
+
+## Distribution of relative engagement (Favorites)
+ggplot(df_model_ext, aes(x = rel_fav)) +
+  geom_histogram(bins = 50) +
+  labs(
+    title = "Distribution of Relative Favorites",
+    x = "Relative Favorites",
+    y = "Count"
+  ) +
+  theme_minimal()
+
+ggplot(df_model_ext, aes(x = rel_rt)) +
+  geom_histogram(bins = 50) +
+  labs(
+    title = "Distribution of Relative Retweets",
+    x = "Relative Retweets",
+    y = "Count"
+  ) +
+  theme_minimal()
+
+# relative favorites by sentiment:
+ggplot(df_model_ext, aes(x = sentiment_label_ext, y = log(rel_fav + 1), fill = sentiment_label_ext)) +
+  geom_boxplot(outlier.alpha = 0.1) +
+  labs(
+    title = "Relative Favorites by Sentiment",
+    x = "Sentiment",
+    y = "Relative Favorites"
+  ) +
+  theme_minimal()
+
+## relative retweet by sentiment
+ggplot(df_model_ext, aes(x = sentiment_label_ext, y = log(rel_rt + 1), fill = sentiment_label_ext)) +
+  geom_boxplot(outlier.alpha = 0.1) +
+  labs(
+    title = "Relative Retweets by Sentiment",
+    x = "Sentiment",
+    y = "Relative Retweets"
+  ) +
+  theme_minimal()
+
+## sentiment–engagement(fav) relationship before vs after 2021
+ggplot(df_model_ext, aes(sentiment_label_ext, log(rel_fav + 1), fill = period)) +
+  geom_boxplot(outlier.alpha = 0.1) +
+  labs(
+    title = "Engagement by Sentiment Before vs After 2021",
+    x = "Sentiment",
+    y = "Relative Favorites"
+  ) +
+  theme_minimal()
+
+## sentiment–engagement(retweets) relationship before vs after 2021
+ggplot(df_model_ext, aes(sentiment_label_ext, log(rel_rt + 1), fill = period)) +
+  geom_boxplot(outlier.alpha = 0.1) +
+  labs(
+    title = "Engagement by Sentiment Before vs After 2021",
+    x = "Sentiment",
+    y = "Relative Retweets"
+  ) +
+  theme_minimal()
+```
+
+## Linear regression model for research quesition 1:
+```{r}
+#model: log(favorites) = sentiment + controls
+lm_fav1 <- lm(log(rel_fav + 1)~ sentiment_afinn_ext + period +  char_count + caps_count + exclaim_count + emphasis, data = df_model_ext)
+tidy(lm_fav1, conf.int = TRUE)
+summary(lm_fav1)
+confint(lm_fav1)
+
+#model: log(retweets) = sentiment + controls
+lm_rt1 <- lm(log(rel_rt + 1)~ sentiment_afinn_ext + period + char_count + caps_count + exclaim_count + emphasis, data = df_model_ext)
+tidy(lm_rt1)
+summary(lm_rt1)
+confint(lm_fav1)
+```
+
+## Linear regression model for research quesition 2:
+```{r}
+#model: log(favorites) = sentiment + period + sentiment x period + controls
+lm_fav2 <- lm(log(rel_fav + 1) ~ sentiment_afinn_ext * period + char_count + caps_count + exclaim_count + emphasis, data = df_model_ext)
+tidy(lm_fav2, conf.int = TRUE)
+summary(lm_fav2)
+confint(lm_fav2)
+
+#model: log(retweets) = sentiment + period + sentiment x period + controls
+lm_rt2 <- lm(log(rel_rt + 1) ~ sentiment_afinn_ext * period + char_count + caps_count + exclaim_count + emphasis, data = df_model_ext)
+tidy(lm_rt2, conf.int = TRUE)
+summary(lm_rt2)
+confint(lm_rt2)
+```
+
+## interaction plot:
+```{r}
+## interaction between sentiment scores and fav:
+library(patchwork)
+df_model_ext$pred_rel_fav <- predict(lm_fav2)
+
+sent_seq <- seq(min(df_model_ext$sentiment_afinn_ext),
+                max(df_model_ext$sentiment_afinn_ext),
+                length.out = 100)
+
+pred_data <- expand.grid(
+  sentiment_afinn_ext = sent_seq,
+  period = c("Before 2021", "After 2021"),
+  char_count = mean(df_model_ext$char_count),
+  caps_count = mean(df_model_ext$caps_count),
+  exclaim_count = mean(df_model_ext$exclaim_count),
+  emphasis = factor(FALSE, levels = levels(df_model_ext$emphasis))
+)
+
+pred_data$pred <- predict(lm_fav2, newdata = pred_data)
+
+p3 <- ggplot(pred_data,
+       aes(x = sentiment_afinn_ext,
+           y = pred,
+           color = period)) +
+  geom_line(size = 1.2) +
+  labs(
+    title = "Effect of Sentiment on Engagement Before and After 2021",
+    x = "Sentiment Score",
+    y = "Predicted Log(Relative Favorites + 1)"
+  ) +
+  theme_minimal()
+
+## interaction between sentiment scores and retweets:
+# sequence of sentiment values
+sent_seq <- seq(min(df_model_ext$sentiment_afinn_ext),
+                max(df_model_ext$sentiment_afinn_ext),
+                length.out = 100)
+
+# create prediction dataset
+pred_data_rt <- expand.grid(
+  sentiment_afinn_ext = sent_seq,
+  period = c("Before 2021", "After 2021"),
+  char_count = mean(df_model_ext$char_count),
+  caps_count = mean(df_model_ext$caps_count),
+  exclaim_count = mean(df_model_ext$exclaim_count),
+  emphasis = factor(FALSE, levels = levels(df_model_ext$emphasis))
+)
+
+# predicted values from retweet model
+pred_data_rt$pred <- predict(lm_rt2, newdata = pred_data_rt)
+
+# plot
+p4 <- ggplot(pred_data_rt,
+       aes(x = sentiment_afinn_ext,
+           y = pred,
+           color = period)) +
+  geom_line(size = 1.2) +
+  labs(
+    x = "Sentiment Score",
+    y = "Predicted Log(Relative Retweets + 1)"
+  ) +
+  theme_minimal()
+
+p3 + p4
+```
+
+## visualizing the correlation between sentiment score and engagment:
+```{r}
+ggplot(df_model_ext, aes(x = sentiment_afinn_ext, y = log(rel_fav + 1))) +
+  geom_point(alpha = 0.05) +
+  geom_smooth(method = "lm", color = "blue") +
+  labs(
+    title = "Sentiment vs Favorites",
+    x = "Sentiment Score",
+    y = "log(Favorites)"
+  )
+
+ggplot(df_model_ext, aes(x = sentiment_afinn_ext, y = log(rel_rt + 1))) +
+  geom_point(alpha = 0.05) +
+  geom_smooth(method = "lm", color = "red") +
+  labs(
+    title = "Sentiment vs Retweets",
+    x = "Sentiment Score",
+    y = "log(Retweets)"
+  )
+
+library(patchwork)
+
+p1 <- ggplot(df_model_ext, aes(x = sentiment_afinn_ext, y = log(rel_fav + 1))) +
+  geom_point(alpha = 0.05) +
+  geom_smooth(method = "lm") +
+  labs(title="Favorites")
+
+p2 <- ggplot(df_model_ext, aes(x = sentiment_afinn_ext, y = log(rel_rt + 1))) +
+  geom_point(alpha = 0.05) +
+  geom_smooth(method = "lm") +
+  labs(title="Retweets")
+
+p1 + p2
+```
+
+## more data visualizations:
+```{r}
+#plot - sentiment vs favorites
+ggplot(df_model_ext, aes(x = sentiment_afinn_ext, y = log(rel_fav + 1), color = period)) +
+  geom_point(alpha = 0.05) +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(
+  title = "Sentiment vs Favorites (log1p), by Period",
+  x = "AFINN sentiment score",
+  y = "log1p(Favorites)"
+)
+#plot - sentiment distribution
+ggplot(df_model_ext, aes(x = sentiment_afinn_ext, fill = period)) +
+  geom_density(alpha = 0.4) +
+  labs(
+  title = "Distribution of Sentiment Scores by Period",
+  x = "AFINN Sentiment Score",
+  y = "Density"
+)
+#top words by period (descending order)
+words_period <- df_feat %>%
+  mutate(text_clean = str_remove_all(text, "https?://\\S+")) %>%
+  unnest_tokens(word, text_clean) %>%
+  inner_join(bing, by = "word") %>%
+  count(period, sentiment, word, sort = TRUE)
+  top_words <- words_period %>%
+  group_by(period, sentiment) %>%
+  slice_max(n, n = 10) %>%
+  ungroup() %>%
+  mutate(word = reorder_within(word, n, interaction(period, sentiment)))
+#plot - top sentiments by period
+ggplot(top_words, aes(x = word, y = n, fill = sentiment)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ period + sentiment, scales = "free") +
+  coord_flip() +
+  scale_x_reordered() +
+  labs(
+  title = "Top Sentiment Words by Period",
+  x = "Word",
+  y = "Frequency"
+)
+```
